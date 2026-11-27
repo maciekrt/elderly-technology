@@ -29,3 +29,7 @@ Node lives in `~/.local/node/bin`. Add `export PATH="$HOME/.local/node/bin:$PATH
 - `CLAUDE_MODEL`: the default is `claude-opus-5-5` at low effort. `claude-haiku-5-5` responds faster.
 - `VAD_SILENCE_SECS`: how long a pause ends the caller's turn (default 0.8).
 - `SYSTEM_PROMPT`, `GREETING`, `ELEVENLABS_VOICE_ID`.
+
+## Docs
+
+- [Market analysis](docs/market-analysis.md): Poland → CEE/EU, competitors, US lessons, unit economics, risks.
