@@ -6,6 +6,7 @@
  * Audio is mu-law 8 kHz end to end, so no transcoding is needed.
  */
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import twilio from "twilio";
 import { WebSocket, WebSocketServer } from "ws";
@@ -15,10 +16,12 @@ import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 // ---------- config ----------
 const PORT = Number(process.env.PORT ?? 8080);
 // e.g. abcd-1234.ngrok-free.app. A pasted "https://…/" is tolerated and stripped.
-const PUBLIC_HOST = required("PUBLIC_HOST")
+// Only needed for real phone calls; local testing via /local works without it.
+const PUBLIC_HOST = (process.env.PUBLIC_HOST ?? "")
   .trim()
   .replace(/^[a-z]+:\/\//i, "")
   .replace(/\/+$/, "");
+const LOCAL_CALL_PAGE = fileURLToPath(new URL("../public/local-call.html", import.meta.url));
 const ELEVENLABS_API_KEY = required("ELEVENLABS_API_KEY");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN; // if unset, signature check is skipped
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "JBFqnCBsd6RMkjVDRZzb"; // "George"
@@ -46,10 +49,23 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 app.get("/", (_req, res) => {
-  res.send("Voice agent is running. Point your Twilio number at POST /incoming-call.");
+  res.send(
+    "Voice agent is running. Point your Twilio number at POST /incoming-call, " +
+      "or open /local to talk to it from this browser.",
+  );
+});
+
+// Local test client: a browser page that pretends to be Twilio on /media.
+app.get("/local", (_req, res) => {
+  // dotfiles: "allow" because the checkout itself may live under a dot-directory (e.g. ~/.paseo).
+  res.sendFile(LOCAL_CALL_PAGE, { dotfiles: "allow" });
 });
 
 app.post("/incoming-call", (req, res) => {
+  if (!PUBLIC_HOST) {
+    res.status(503).send("PUBLIC_HOST not set; Twilio calls are disabled (see .env.example).");
+    return;
+  }
   if (TWILIO_AUTH_TOKEN) {
     const signature = req.header("X-Twilio-Signature") ?? "";
     const url = `https://${PUBLIC_HOST}/incoming-call`;
@@ -348,6 +364,8 @@ async function speak(call: Call, turn: number, text: string) {
 
 server.listen(PORT, () => {
   console.log(`Listening on :${PORT}`);
-  console.log(`Twilio webhook: https://${PUBLIC_HOST}/incoming-call (HTTP POST)`);
+  console.log(`Local test call: http://localhost:${PORT}/local`);
+  if (PUBLIC_HOST) console.log(`Twilio webhook: https://${PUBLIC_HOST}/incoming-call (HTTP POST)`);
+  else console.log("PUBLIC_HOST not set: Twilio calls disabled, local testing only.");
   console.log(`LLM: ${CLAUDE_MODEL}`);
 });

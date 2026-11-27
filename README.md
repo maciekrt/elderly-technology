@@ -24,6 +24,32 @@ agent stops it and clears Twilio's audio buffer), a greeting, and Twilio webhook
 
 Node lives in `~/.local/node/bin`. Add `export PATH="$HOME/.local/node/bin:$PATH"` to `~/.zshrc`.
 
+## Local testing (no Twilio)
+
+Both tools below act as a fake Twilio client on `/media`, so the real pipeline runs: STT, VAD
+turn-taking, Claude, TTS, marks, and barge-in. Only `ELEVENLABS_API_KEY` and `ANTHROPIC_API_KEY`
+are needed. `PUBLIC_HOST`, `TWILIO_AUTH_TOKEN`, and ngrok are not.
+
+**Talk to it live:** run `npm run dev` and open <http://localhost:8080/local> in Chrome. Click
+*Start call* and allow the mic. The page plays the greeting, and you can talk over the agent to
+test barge-in. Transcripts (`caller:` / `agent:`) appear in the server terminal. If the agent
+keeps interrupting itself because it hears its own voice through your speakers, use headphones
+or tick *Mute mic while the agent is speaking*. That option turns off barge-in.
+
+**Scripted end-to-end test:** `npm run test:call`. This starts the server on a free port and
+synthesizes the caller's lines with ElevenLabs TTS. It streams those lines in real time, waits
+for each reply, and prints the reply length and latency for each turn. It exits 1 if the greeting
+or any reply is missing. It also saves `recordings/call-<time>.wav`, with the user on the left
+channel and the agent on the right (`afplay recordings/call-*.wav`).
+
+```
+npm run test:call -- "Hello, who am I talking to?" "Okay, bye!"   # your own lines
+npm run test:call -- --url ws://localhost:8080/media             # use a server that's already running
+```
+
+Every test call costs real API credits. While ngrok is running, anyone with the URL can reach
+`/local` and `/media`.
+
 ## Tuning
 
 - `CLAUDE_MODEL`: the default is `claude-opus-5-5` at low effort. `claude-haiku-5-5` responds faster.

@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Local test call</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 34rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+  button { font-size: 1.1rem; padding: .6rem 1.4rem; border-radius: .5rem; border: 0; cursor: pointer;
+           background: #1a7f37; color: #fff; }
+  button.hangup { background: #cf222e; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin: 1rem 0 .5rem; font-weight: 600; }
+  .meter { height: .6rem; background: color-mix(in srgb, currentColor 15%, transparent); border-radius: .3rem; overflow: hidden; }
+  .meter > div { height: 100%; width: 0; background: #2da44e; transition: width 60ms linear; }
+  label { display: block; margin-top: 1rem; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Local test call</h1>
+<p>Talks to the agent over <code>/media</code> the way Twilio would, using your mic and speakers.
+  The <code>caller:</code> and <code>agent:</code> transcript lines appear in the server terminal.</p>
+
+<button id="call">Start call</button>
+<div id="status">Idle</div>
+<div class="meter" title="Mic level"><div id="level"></div></div>
+<label><input type="checkbox" id="halfDuplex" />
+  Mute mic while the agent is speaking <small>(use this on speakers if the agent keeps interrupting itself;
+  it turns off barge-in)</small></label>
+
+<script>
+"use strict";
+
+// ---------- G.711 mu-law ----------
+function linearToUlaw(s) { // s: int16
+  const BIAS = 0x84, CLIP = 32635;
+  const sign = (s >> 8) & 0x80;
+  if (sign) s = -s;
+  if (s > CLIP) s = CLIP;
+  s += BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; exponent--, mask >>= 1) {}
+  const mantissa = (s >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+function ulawToLinear(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80, exponent = (u >> 4) & 0x07, mantissa = u & 0x0f;
+  const s = (((mantissa << 3) + 0x84) << exponent) - 0x84;
+  return sign ? -s : s;
+}
+
+// Runs on the audio thread: downsample the mic to 8 kHz, mu-law encode, and emit 20 ms frames.
+const WORKLET_SRC = `
+${linearToUlaw.toString()}
+class UlawEncoder extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ratio = sampleRate / 8000;
+    this.t = 0; this.acc = 0; this.n = 0;
+    this.frame = new Uint8Array(160); this.pos = 0; this.sq = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.acc += ch[i]; this.n++; this.t++;
+      if (this.t >= this.ratio) {          // box-filter decimation to 8 kHz
+        this.t -= this.ratio;
+        const v = Math.max(-1, Math.min(1, this.acc / this.n));
+        this.acc = 0; this.n = 0;
+        this.sq += v * v;
+        this.frame[this.pos++] = linearToUlaw(Math.round(v * 32767));
+        if (this.pos === 160) {
+          this.port.postMessage({ frame: this.frame, level: Math.sqrt(this.sq / 160) }, [this.frame.buffer]);
+          this.frame = new Uint8Array(160); this.pos = 0; this.sq = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("ulaw-encoder", UlawEncoder);
+`;
+
+const SILENCE_FRAME = new Uint8Array(160).fill(0xff);
+const $ = (id) => document.getElementById(id);
+const toB64 = (bytes) => btoa(String.fromCharCode.apply(null, bytes));
+const fromB64 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+let call = null; // active call state
+
+$("call").onclick = () => (call ? hangUp() : startCall().catch(fail));
+
+function setStatus(text) { $("status").textContent = text; }
+function fail(err) {
+  console.error(err);
+  hangUp();
+  setStatus("Error: " + (err && err.message ? err.message : err));
+}
+
+async function startCall() {
+  $("call").disabled = true;
+  setStatus("Starting microphone…");
+  const ctx = new AudioContext();
+  const mic = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+  });
+  const workletUrl = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+  await ctx.audioWorklet.addModule(workletUrl);
+  URL.revokeObjectURL(workletUrl);
+
+  const src = ctx.createMediaStreamSource(mic);
+  const encoder = new AudioWorkletNode(ctx, "ulaw-encoder");
+  const sink = ctx.createGain();
+  sink.gain.value = 0; // keeps the encoder pulled by the graph without playing the mic back
+  src.connect(encoder).connect(sink).connect(ctx.destination);
+
+  const id = Math.random().toString(36).slice(2, 12);
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/media`);
+
+  call = {
+    ctx, mic, encoder, ws,
+    streamSid: "MZlocal-" + id,
+    chunk: 0,
+    t0: performance.now(),
+    nextPlayTime: 0,
+    sources: new Set(),
+    marks: [], // { name, at } waiting for playback to reach `at`
+    timer: 0,
+  };
+  const c = call;
+
+  setStatus("Connecting…");
+  ws.onopen = () => {
+    send(c, { event: "connected", protocol: "Call", version: "1.0.0" });
+    send(c, {
+      event: "start",
+      sequenceNumber: "1",
+      start: {
+        streamSid: c.streamSid, callSid: "CAlocal-" + id, accountSid: "ACLOCAL",
+        tracks: ["inbound"], customParameters: {},
+        mediaFormat: { encoding: "audio/x-mulaw", sampleRate: 8000, channels: 1 },
+      },
+      streamSid: c.streamSid,
+    });
+    $("call").textContent = "Hang up";
+    $("call").classList.add("hangup");
+    $("call").disabled = false;
+    c.timer = setInterval(() => tick(c), 20);
+  };
+  ws.onmessage = (e) => onServerMessage(c, e.data);
+  ws.onclose = () => { if (call === c) { hangUp(); setStatus("Call ended by server"); } };
+  ws.onerror = () => { if (call === c) fail(new Error("WebSocket error (is the server running?)")); };
+
+  encoder.port.onmessage = ({ data }) => {
+    $("level").style.width = Math.min(100, data.level * 400) + "%";
+    if (c.ws.readyState !== WebSocket.OPEN) return;
+    const muted = $("halfDuplex").checked && agentSpeaking(c);
+    sendMedia(c, muted ? SILENCE_FRAME : data.frame);
+  };
+}
+
+function send(c, msg) {
+  if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
+}
+
+function sendMedia(c, frame) {
+  c.chunk++;
+  send(c, {
+    event: "media",
+    streamSid: c.streamSid,
+    media: {
+      track: "inbound",
+      chunk: String(c.chunk),
+      timestamp: String(Math.round(performance.now() - c.t0)),
+      payload: toB64(frame),
+    },
+  });
+}
+
+const agentSpeaking = (c) => c.nextPlayTime > c.ctx.currentTime;
+
+function onServerMessage(c, raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+  switch (msg.event) {
+    case "media": {
+      const bytes = fromB64(msg.media.payload);
+      if (!bytes.length) return;
+      const buf = c.ctx.createBuffer(1, bytes.length, 8000);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bytes.length; i++) data[i] = ulawToLinear(bytes[i]) / 32768;
+      const node = c.ctx.createBufferSource();
+      node.buffer = buf;
+      node.connect(c.ctx.destination);
+      const at = Math.max(c.nextPlayTime, c.ctx.currentTime + 0.02);
+      node.start(at);
+      c.nextPlayTime = at + buf.duration;
+      c.sources.add(node);
+      node.onended = () => c.sources.delete(node);
+      break;
+    }
+    case "mark":
+      // Twilio echoes a mark once all audio sent before it has been played.
+      c.marks.push({ name: msg.mark.name, at: Math.max(c.nextPlayTime, c.ctx.currentTime) });
+      break;
+    case "clear":
+      // Barge-in: drop buffered audio, and (like Twilio) return outstanding marks right away.
+      for (const node of c.sources) { try { node.stop(); } catch {} }
+      c.sources.clear();
+      c.nextPlayTime = 0;
+      for (const m of c.marks.splice(0)) send(c, { event: "mark", streamSid: c.streamSid, mark: { name: m.name } });
+      break;
+  }
+}
+
+function tick(c) {
+  const now = c.ctx.currentTime;
+  while (c.marks.length && c.marks[0].at <= now) {
+    const m = c.marks.shift();
+    send(c, { event: "mark", streamSid: c.streamSid, mark: { name: m.name } });
+  }
+  setStatus(agentSpeaking(c) ? "Agent speaking…" : "Listening…");
+}
+
+function hangUp() {
+  const c = call;
+  call = null;
+  $("call").textContent = "Start call";
+  $("call").classList.remove("hangup");
+  $("call").disabled = false;
+  $("level").style.width = "0";
+  setStatus("Idle");
+  if (!c) return;
+  clearInterval(c.timer);
+  send(c, { event: "stop", streamSid: c.streamSid, stop: { callSid: "local" } });
+  c.ws.onclose = null;
+  c.ws.close();
+  c.mic.getTracks().forEach((t) => t.stop());
+  c.encoder.port.onmessage = null;
+  c.ctx.close();
+}
+</script>
+</body>
+</html>
