@@ -1,0 +1,29 @@
+{
+  "name": "voice-agent",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/server.ts",
+    "start": "tsx --env-file=.env src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.14.0",
+    "@elevenlabs/elevenlabs-js": "^2.80.0",
+    "express": "^5.3.0",
+    "twilio": "^6.3.1",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.11",
+    "@types/ws": "^8.18.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
